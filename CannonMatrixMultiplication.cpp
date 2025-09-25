@@ -31,7 +31,7 @@ int freeMatrix(int*** mat) {
 void generate_matrix(int** mat, int dim) {
     // Seed with a value that is the same for all processes initially
     // but allow rank 0 to control the true seed time.
-    srand(1); 
+    srand(1);
     if (mat) { // Ensure matrix is not NULL
         for (int i = 0; i < dim; i++) {
             for (int j = 0; j < dim; j++) {
@@ -132,12 +132,12 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "[ERROR] Allocation failed on rank 0\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        
+
         // Seed random number generator on rank 0 only
         srand(time(NULL));
         generate_matrix(A, rows);
         generate_matrix(B, rows);
-        
+
         if (rows < 10) {
             printf("Matrix A:\n");
             for(int i=0; i<rows; i++) { for(int j=0; j<rows; j++) printf("%d ", A[i][j]); printf("\n"); }
@@ -167,16 +167,9 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[ERROR] Local allocation failed on rank %d\n", rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
-    // ----------- FIX STARTS HERE: SCATTER SECTION -----------
-    
-    // 1. Create a datatype for a single block (a vector of vectors)
-    MPI_Datatype blocktype;
+
+    MPI_Datatype blocktype, blocktype_resized;
     MPI_Type_vector(blockDim, blockDim, rows, MPI_INT, &blocktype);
-    
-    // 2. Create a resized datatype where the extent matches the displacement unit (int)
-    MPI_Datatype blocktype_resized;
-    // The lower bound is 0, the extent is a single integer. This is the crucial fix.
     MPI_Type_create_resized(blocktype, 0, sizeof(int), &blocktype_resized);
     MPI_Type_commit(&blocktype_resized);
 
@@ -188,12 +181,10 @@ int main(int argc, char* argv[]) {
             sendcounts[i] = 1;
             int p_coords[2];
             MPI_Cart_coords(cartComm, i, 2, p_coords);
-            // Displacement is calculated in units of 'int'
             displs[i] = (p_coords[0] * rows * blockDim) + (p_coords[1] * blockDim);
         }
     }
-    
-    // 3. Use the RESIZED type for scattering. Rank 0 has the data pointer, others can pass NULL.
+
     int* A_ptr = (rank == 0) ? &(A[0][0]) : NULL;
     int* B_ptr = (rank == 0) ? &(B[0][0]) : NULL;
     MPI_Scatterv(A_ptr, sendcounts, displs, blocktype_resized, &(localA[0][0]), blockDim * blockDim, MPI_INT, 0, cartComm);
@@ -202,14 +193,19 @@ int main(int argc, char* argv[]) {
     free(sendcounts);
     free(displs);
     MPI_Type_free(&blocktype);
-    MPI_Type_free(&blocktype_resized); // Free the resized type
-
-    // ----------- END OF SCATTER FIX -----------
-
+    MPI_Type_free(&blocktype_resized);
 
     for (int i = 0; i < blockDim; i++)
         for (int j = 0; j < blockDim; j++)
             localC[i][j] = 0;
+
+    // ----------- TIMING CODE START -----------
+    double start_time, end_time;
+    MPI_Barrier(cartComm); // Synchronize all processes before starting the timer
+    if (rank == 0) {
+        start_time = MPI_Wtime();
+    }
+    // ----------- TIMING CODE START -----------
 
     int shift_source, shift_dest;
     MPI_Cart_shift(cartComm, 1, -coords[0], &shift_source, &shift_dest);
@@ -228,9 +224,15 @@ int main(int argc, char* argv[]) {
         MPI_Sendrecv_replace(&(localB[0][0]), blockDim * blockDim, MPI_INT, shift_dest, 40, shift_source, 40, cartComm, MPI_STATUS_IGNORE);
     }
     
-    // ----------- FIX STARTS HERE: GATHER SECTION -----------
+    // ----------- TIMING CODE END -----------
+    MPI_Barrier(cartComm); // Synchronize all processes before stopping the timer
+    if (rank == 0) {
+        end_time = MPI_Wtime();
+        printf("Parallel calculation took %f seconds.\n", end_time - start_time);
+    }
+    // ----------- TIMING CODE END -----------
 
-    // 1. Create the same datatypes again for the gather operation.
+
     MPI_Datatype gathertype, gathertype_resized;
     MPI_Type_vector(blockDim, blockDim, rows, MPI_INT, &gathertype);
     MPI_Type_create_resized(gathertype, 0, sizeof(int), &gathertype_resized);
@@ -247,17 +249,14 @@ int main(int argc, char* argv[]) {
             recvdispls[i] = (p_coords[0] * rows * blockDim) + (p_coords[1] * blockDim);
         }
     }
-    
-    // 2. Use the RESIZED type for gathering
+
     int* C_ptr = (rank == 0) ? &(C[0][0]) : NULL;
     MPI_Gatherv(&(localC[0][0]), blockDim * blockDim, MPI_INT, C_ptr, recvcounts, recvdispls, gathertype_resized, 0, cartComm);
 
     free(recvcounts);
     free(recvdispls);
     MPI_Type_free(&gathertype);
-    MPI_Type_free(&gathertype_resized); // Free the resized type
-
-    // ----------- END OF GATHER FIX -----------
+    MPI_Type_free(&gathertype_resized);
 
     if (rank == 0) {
         if (rows < 10) {
